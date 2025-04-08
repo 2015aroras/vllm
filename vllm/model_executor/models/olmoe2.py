@@ -11,12 +11,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Inference-only OLMoE model compatible with HuggingFace weights."""
+"""Inference-only OLMoE2 model compatible with HuggingFace weights."""
 from typing import Any, Dict, Iterable, List, Optional, Set, Tuple, Union
 
 import torch
 from torch import nn
-from transformers import PretrainedConfig
+from transformers import Olmoe2Config
 
 from vllm.attention import Attention, AttentionMetadata
 from vllm.compilation.decorators import support_torch_compile
@@ -46,8 +46,8 @@ from .utils import (is_pp_missing_parameter,
 logger = init_logger(__name__)
 
 
-class OlmoeMoE(nn.Module):
-    """A tensor-parallel MoE implementation for Olmoe that shards each expert
+class Olmoe2MoE(nn.Module):
+    """A tensor-parallel MoE implementation for Olmoe2 that shards each expert
     across all ranks.
 
     Each expert's weights are sharded across all ranks and a fused MoE
@@ -94,7 +94,7 @@ class OlmoeMoE(nn.Module):
         return final_hidden_states.view(orig_shape)
 
 
-class OlmoeAttention(nn.Module):
+class Olmoe2Attention(nn.Module):
 
     def __init__(
         self,
@@ -104,6 +104,7 @@ class OlmoeAttention(nn.Module):
         rope_theta: float = 10000,
         rope_scaling: Optional[Dict[str, Any]] = None,
         max_position_embeddings: int = 4096,
+        rms_norm_eps: float = 1e-5,
         cache_config: Optional[CacheConfig] = None,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
@@ -139,8 +140,8 @@ class OlmoeAttention(nn.Module):
             bias=False,
             quant_config=quant_config,
         )
-        self.q_norm = RMSNorm(hidden_size, eps=1e-5)
-        self.k_norm = RMSNorm(hidden_size, eps=1e-5)
+        self.q_norm = RMSNorm(hidden_size, eps=rms_norm_eps)
+        self.k_norm = RMSNorm(hidden_size, eps=rms_norm_eps)
         self.o_proj = RowParallelLinear(
             self.total_num_heads * self.head_dim,
             hidden_size,
@@ -180,11 +181,11 @@ class OlmoeAttention(nn.Module):
         return output
 
 
-class OlmoeDecoderLayer(nn.Module):
+class Olmoe2DecoderLayer(nn.Module):
 
     def __init__(
         self,
-        config: PretrainedConfig,
+        config: Olmoe2Config,
         cache_config: Optional[CacheConfig] = None,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
@@ -196,27 +197,28 @@ class OlmoeDecoderLayer(nn.Module):
         max_position_embeddings = getattr(config, "max_position_embeddings",
                                           4096)
 
-        self.self_attn = OlmoeAttention(
+        self.self_attn = Olmoe2Attention(
             hidden_size=self.hidden_size,
             num_heads=config.num_attention_heads,
             num_kv_heads=config.num_key_value_heads,
             rope_theta=rope_theta,
             rope_scaling=rope_scaling,
             max_position_embeddings=max_position_embeddings,
+            rms_norm_eps=config.rms_norm_eps,
             cache_config=cache_config,
             quant_config=quant_config,
             prefix=f"{prefix}.self_attn",
         )
 
-        self.mlp = OlmoeMoE(
+        self.mlp = Olmoe2MoE(
             num_experts=config.num_experts,
             top_k=config.num_experts_per_tok,
             hidden_size=config.hidden_size,
             intermediate_size=config.intermediate_size,
             quant_config=quant_config,
         )
-        self.input_layernorm = RMSNorm(config.hidden_size, eps=1e-5)
-        self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=1e-5)
+        self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_feedforward_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     def forward(
         self,
@@ -229,10 +231,8 @@ class OlmoeDecoderLayer(nn.Module):
         # Self Attention
         if residual is None:
             residual = hidden_states
-            hidden_states = self.input_layernorm(hidden_states)
         else:
-            hidden_states, residual = self.input_layernorm(
-                hidden_states, residual)
+            residual = hidden_states + residual
 
         hidden_states = self.self_attn(
             positions=positions,
@@ -240,21 +240,24 @@ class OlmoeDecoderLayer(nn.Module):
             kv_cache=kv_cache,
             attn_metadata=attn_metadata,
         )
+        hidden_states = self.post_attention_layernorm(hidden_states)
+        hidden_states = residual + hidden_states
+        residual = hidden_states
 
         # Fully Connected
-        hidden_states, residual = self.post_attention_layernorm(
-            hidden_states, residual)
         hidden_states = self.mlp(hidden_states)
+        hidden_states = self.post_feedforward_layernorm(hidden_states)
         return hidden_states, residual
 
 
 @support_torch_compile
-class OlmoeModel(nn.Module):
+class Olmoe2Model(nn.Module):
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
 
         config = vllm_config.model_config.hf_config
+        assert isinstance(config, Olmoe2Config)
         cache_config = vllm_config.cache_config
         quant_config = vllm_config.quant_config
 
@@ -267,10 +270,10 @@ class OlmoeModel(nn.Module):
         )
         self.start_layer, self.end_layer, self.layers = make_layers(
             config.num_hidden_layers,
-            lambda prefix: OlmoeDecoderLayer(
+            lambda prefix: Olmoe2DecoderLayer(
                 config, cache_config, quant_config, prefix=prefix),
             prefix=f"{prefix}.layers")
-        self.norm = RMSNorm(config.hidden_size, eps=1e-5)
+        self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
         self.make_empty_intermediate_tensors = (
             make_empty_intermediate_tensors_factory(
@@ -319,7 +322,7 @@ class OlmoeModel(nn.Module):
         return hidden_states
 
 
-class OlmoeForCausalLM(nn.Module, SupportsPP):
+class Olmoe2ForCausalLM(nn.Module, SupportsPP):
 
     fall_back_to_pt_during_load = False
 
@@ -329,8 +332,8 @@ class OlmoeForCausalLM(nn.Module, SupportsPP):
         quant_config = vllm_config.quant_config
         self.config = config
         self.quant_config = quant_config
-        self.model = OlmoeModel(vllm_config=vllm_config,
-                                prefix=maybe_prefix(prefix, "model"))
+        self.model = Olmoe2Model(vllm_config=vllm_config,
+                                 prefix=maybe_prefix(prefix, "model"))
         self.lm_head = ParallelLMHead(config.vocab_size,
                                       config.hidden_size,
                                       quant_config=quant_config)
