@@ -226,26 +226,19 @@ class Olmoe2DecoderLayer(nn.Module):
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
-        residual: Optional[torch.Tensor],
     ) -> torch.Tensor:
-        # Self Attention
-        if residual is None:
-            residual = hidden_states
-        else:
-            residual = hidden_states + residual
-
-        hidden_states = self.self_attn(
-            positions=positions,
-            hidden_states=hidden_states,
-        )
-        hidden_states = self.post_attention_layernorm(hidden_states)
-        hidden_states = residual + hidden_states
+        # Attention block.
         residual = hidden_states
+        hidden_states = self.self_attn(positions, hidden_states)
+        hidden_states, residual = self.post_attention_layernorm(
+            hidden_states, residual)
 
-        # Fully Connected
+        # MLP block.
+        residual = hidden_states
         hidden_states = self.mlp(hidden_states)
-        hidden_states = self.post_feedforward_layernorm(hidden_states)
-        return hidden_states, residual
+        hidden_states, residual = self.post_feedforward_layernorm(
+            hidden_states, residual)
+        return hidden_states
 
 
 @support_torch_compile
@@ -264,6 +257,7 @@ class Olmoe2Model(nn.Module):
         self.embed_tokens = VocabParallelEmbedding(
             config.vocab_size,
             config.hidden_size,
+            prefix=f"{prefix}.embed_tokens",
         )
         self.start_layer, self.end_layer, self.layers = make_layers(
             config.num_hidden_layers,
@@ -273,8 +267,8 @@ class Olmoe2Model(nn.Module):
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
         self.make_empty_intermediate_tensors = (
-            make_empty_intermediate_tensors_factory(
-                ["hidden_states", "residual"], config.hidden_size))
+            make_empty_intermediate_tensors_factory(["hidden_states"],
+                                                    config.hidden_size))
 
     def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
@@ -291,26 +285,22 @@ class Olmoe2Model(nn.Module):
                 hidden_states = inputs_embeds
             else:
                 hidden_states = self.get_input_embeddings(input_ids)
-            residual = None
         else:
             assert intermediate_tensors is not None
             hidden_states = intermediate_tensors["hidden_states"]
-            residual = intermediate_tensors["residual"]
 
         for layer in self.layers[self.start_layer:self.end_layer]:
-            hidden_states, residual = layer(
+            hidden_states = layer(
                 positions,
                 hidden_states,
-                residual,
             )
 
         if not get_pp_group().is_last_rank:
             return IntermediateTensors({
                 "hidden_states": hidden_states,
-                "residual": residual
             })
 
-        hidden_states, _ = self.norm(hidden_states, residual)
+        hidden_states, _ = self.norm(hidden_states)
         return hidden_states
 
 
@@ -321,6 +311,7 @@ class Olmoe2ForCausalLM(nn.Module, SupportsPP):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
         config = vllm_config.model_config.hf_config
+        assert isinstance(config, Olmoe2Config)
         quant_config = vllm_config.quant_config
         self.config = config
         self.quant_config = quant_config
@@ -328,7 +319,8 @@ class Olmoe2ForCausalLM(nn.Module, SupportsPP):
                                  prefix=maybe_prefix(prefix, "model"))
         self.lm_head = ParallelLMHead(config.vocab_size,
                                       config.hidden_size,
-                                      quant_config=quant_config)
+                                      quant_config=quant_config,
+                                      prefix=maybe_prefix(prefix, "lm_head"))
         self.logits_processor = LogitsProcessor(config.vocab_size)
         self.sampler = get_sampler()
 
