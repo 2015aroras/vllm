@@ -300,7 +300,7 @@ class Olmoe2Model(nn.Module):
                 "hidden_states": hidden_states,
             })
 
-        hidden_states, _ = self.norm(hidden_states)
+        hidden_states = self.norm(hidden_states)
         return hidden_states
 
 
