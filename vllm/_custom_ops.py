@@ -1286,6 +1286,9 @@ if supports_moe_ops and hasattr(torch.ops._moe_C, "marlin_gemm_moe"):
                            dtype=a.dtype,
                            device=a.device)
 
+
+if supports_moe_ops and hasattr(torch.ops._moe_C, "moe_wna16_marlin_gemm"):
+
     @register_fake("_moe_C::moe_wna16_marlin_gemm")
     def moe_wna16_marlin_gemm_fake(input: torch.Tensor,
                                    output: Optional[torch.Tensor],
