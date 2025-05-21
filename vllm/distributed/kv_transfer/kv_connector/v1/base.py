@@ -22,7 +22,6 @@ The class provides the following primitives:
 
 import enum
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Optional
 
 import torch
@@ -48,7 +47,6 @@ class KVConnectorRole(enum.Enum):
     WORKER = 1
 
 
-@dataclass
 class KVConnectorMetadata:
     """
     Abstract Metadata used to communicate between the
@@ -185,7 +183,8 @@ class KVConnectorBase_V1(ABC):
         finished generating tokens.
 
         Returns:
-            ids of requests that have finished asynchronous (recving, sending).
+            ids of requests that have finished asynchronous transfer,
+            tuple of (sending/saving ids, recving/loading ids).
             The finished saves/sends req ids must belong to a set provided in a
             call to this method (this call or a prior one).
         """
