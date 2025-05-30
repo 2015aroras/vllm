@@ -12,27 +12,30 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """Inference-only OLMoE2 model compatible with HuggingFace weights."""
+from collections.abc import Iterable
 from functools import partial
-from typing import Any, Dict, Iterable, Optional, Set, Tuple, Union
+from typing import Optional, Union
 
 import torch
 from torch import nn
-from transformers import Olmoe2Config
+from transformers.models.olmoe2 import Olmoe2Config
 
 from vllm.attention import Attention
 from vllm.compilation.decorators import support_torch_compile
-from vllm.config import CacheConfig, VllmConfig
+from vllm.config import VllmConfig
 from vllm.distributed import get_pp_group, get_tensor_model_parallel_world_size
 from vllm.distributed.communication_op import tensor_model_parallel_all_gather
+from vllm.distributed.parallel_state import get_tensor_model_parallel_rank
 from vllm.distributed.utils import split_tensor_along_last_dim
 from vllm.logger import init_logger
+from vllm.model_executor.layers.activation import SiluAndMul
 from vllm.model_executor.layers.fused_moe import FusedMoE
 from vllm.model_executor.layers.layernorm import RMSNorm
-from vllm.model_executor.layers.linear import (QKVParallelLinear,
+from vllm.model_executor.layers.linear import (MergedColumnParallelLinear,
+                                               QKVParallelLinear,
                                                ReplicatedLinear,
                                                RowParallelLinear)
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
-from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.layers.sampler import SamplerOutput, get_sampler
 from vllm.model_executor.layers.vocab_parallel_embedding import (
@@ -49,6 +52,52 @@ from .utils import (is_pp_missing_parameter,
 logger = init_logger(__name__)
 
 
+class Olmoe2SharedMLP(nn.Module):
+    """
+    This is the MLP block where the output is computed as
+    ``MLP(x)`` in ``LN(MLP(x + LN(Attention(x))))``
+    (plus another skip connection).
+    """
+
+    def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
+        super().__init__()
+        config = vllm_config.model_config.hf_config
+        assert isinstance(config, Olmoe2Config)
+        hidden_size = config.hidden_size
+        intermediate_size = config.shared_mlp_intermediate_size
+        assert intermediate_size is not None
+
+        # Feed-forward input projection.
+        self.gate_up_proj = MergedColumnParallelLinear(
+            hidden_size,
+            [intermediate_size] * 2,
+            bias=False,
+            quant_config=vllm_config.quant_config,
+            prefix=f"{prefix}.gate_up_proj",
+        )
+
+        # Activation function.
+        self.act_fn = SiluAndMul()
+
+        # Feed-forward output projection.
+        self.down_proj = RowParallelLinear(
+            intermediate_size,
+            hidden_size,
+            bias=False,
+            quant_config=vllm_config.quant_config,
+            prefix=f"{prefix}.down_proj",
+        )
+
+    def forward(
+        self,
+        x: torch.Tensor,
+    ) -> torch.Tensor:
+        gate_up, _ = self.gate_up_proj(x)
+        x = self.act_fn(gate_up)
+        x, _ = self.down_proj(x)
+        return x
+
+
 class Olmoe2MoE(nn.Module):
     """A tensor-parallel MoE implementation for Olmoe2 that shards each expert
     across all ranks.
@@ -58,68 +107,87 @@ class Olmoe2MoE(nn.Module):
     across ranks.
     """
 
-    def __init__(self,
-                 num_experts: int,
-                 top_k: int,
-                 hidden_size: int,
-                 intermediate_size: int,
-                 params_dtype: Optional[torch.dtype] = None,
-                 quant_config: Optional[QuantizationConfig] = None,
-                 tp_size: Optional[int] = None,
-                 prefix: str = ""):
+    def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
-        self.hidden_size = hidden_size
+
+        hf_config = vllm_config.model_config.hf_config
+        assert isinstance(hf_config, Olmoe2Config)
+
+        tp_size = get_tensor_model_parallel_world_size()
 
         # Gate always runs at half / full precision for now.
-        self.gate = ReplicatedLinear(hidden_size,
-                                     num_experts,
+        self.gate = ReplicatedLinear(hf_config.hidden_size,
+                                     hf_config.num_experts,
                                      bias=False,
-                                     quant_config=None)
+                                     quant_config=None,
+                                     prefix=f"{prefix}.gate")
 
-        self.experts = FusedMoE(num_experts=num_experts,
-                                top_k=top_k,
-                                hidden_size=hidden_size,
-                                intermediate_size=intermediate_size,
+        # Gate always runs at half / full precision for now.
+        self.experts = FusedMoE(num_experts=hf_config.num_experts,
+                                top_k=hf_config.num_experts_per_tok,
+                                hidden_size=hf_config.hidden_size,
+                                intermediate_size=hf_config.intermediate_size,
                                 reduce_results=True,
                                 renormalize=False,
-                                quant_config=quant_config,
+                                quant_config=None,
                                 tp_size=tp_size,
+                                use_grouped_topk=True,
+                                scoring_func="sigmoid",
+                                num_expert_group=1,
+                                topk_group=1,
                                 prefix=f"{prefix}.experts")
+
+        self.top_k = hf_config.num_experts_per_tok
+
+        self.shared_mlp = None
+        if hf_config.shared_mlp_intermediate_size is not None:
+            self.shared_mlp = Olmoe2SharedMLP(vllm_config=vllm_config,
+                                              prefix=f"{prefix}.shared_mlp")
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         # NOTE: hidden_states can have either 1D or 2D shape.
         orig_shape = hidden_states.shape
         hidden_dim = hidden_states.shape[-1]
         hidden_states = hidden_states.view(-1, hidden_dim)
+
+        shared_hidden_states = None
+        if self.shared_mlp is not None:
+            # The experts mutate the hidden state, so compute this before them
+            # to avoid issues.
+            shared_hidden_states = self.shared_mlp(hidden_states)
+
         # router_logits: (num_tokens, n_experts)
         router_logits, _ = self.gate(hidden_states)
-        final_hidden_states = self.experts(hidden_states=hidden_states,
-                                           router_logits=router_logits)
+        # Warning: The experts mutate the hidden state input!!! This messes up
+        # basic things like the residual stream.
+        final_hidden_states = self.experts(
+            hidden_states=hidden_states.detach().clone(),
+            router_logits=router_logits)
+
+        if shared_hidden_states is not None:
+            final_hidden_states = (shared_hidden_states + self.top_k *
+                                   final_hidden_states) / (self.top_k + 1)
+
         return final_hidden_states.view(orig_shape)
 
 
 class Olmoe2Attention(nn.Module):
 
-    def __init__(
-        self,
-        hidden_size: int,
-        num_heads: int,
-        num_kv_heads: int,
-        rope_theta: float = 10000,
-        rope_scaling: Optional[Dict[str, Any]] = None,
-        max_position_embeddings: int = 4096,
-        rms_norm_eps: float = 1e-5,
-        cache_config: Optional[CacheConfig] = None,
-        quant_config: Optional[QuantizationConfig] = None,
-        prefix: str = "",
-    ) -> None:
+    def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__()
-        self.hidden_size = hidden_size
+
+        hf_config = vllm_config.model_config.hf_config
+        assert isinstance(hf_config, Olmoe2Config)
+
         tp_size = get_tensor_model_parallel_world_size()
-        self.total_num_heads = num_heads
+        self.tp_size = tp_size
+        self.tp_rank = get_tensor_model_parallel_rank()
+
+        self.hidden_size = hf_config.hidden_size
+        self.total_num_heads = hf_config.num_attention_heads
         assert self.total_num_heads % tp_size == 0
         self.num_heads = self.total_num_heads // tp_size
-        self.total_num_kv_heads = num_kv_heads
+        self.total_num_kv_heads = hf_config.num_key_value_heads
         if self.total_num_kv_heads >= tp_size:
             # Number of KV heads is greater than TP size, so we partition
             # the KV heads across multiple tensor parallel GPUs.
@@ -129,49 +197,49 @@ class Olmoe2Attention(nn.Module):
             # the KV heads across multiple tensor parallel GPUs.
             assert tp_size % self.total_num_kv_heads == 0
         self.num_kv_heads = max(1, self.total_num_kv_heads // tp_size)
-        self.head_dim = hidden_size // self.total_num_heads
+        self.head_dim = self.hidden_size // self.total_num_heads
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim
         self.scaling = self.head_dim**-0.5
-        self.rope_theta = rope_theta
-        self.max_position_embeddings = max_position_embeddings
+        self.rope_theta = hf_config.rope_theta
+        self.max_position_embeddings = hf_config.max_position_embeddings
 
         self.qkv_proj = QKVParallelLinear(
-            hidden_size,
+            self.hidden_size,
             self.head_dim,
             self.total_num_heads,
             self.total_num_kv_heads,
             bias=False,
-            quant_config=quant_config,
+            quant_config=vllm_config.quant_config,
         )
-        self.q_norm = RMSNorm(hidden_size, eps=rms_norm_eps)
-        self.k_norm = RMSNorm(hidden_size, eps=rms_norm_eps)
+        self.q_norm = RMSNorm(self.hidden_size, eps=hf_config.rms_norm_eps)
+        self.k_norm = RMSNorm(self.hidden_size, eps=hf_config.rms_norm_eps)
         self.o_proj = RowParallelLinear(
             self.total_num_heads * self.head_dim,
-            hidden_size,
+            self.hidden_size,
             bias=False,
-            quant_config=quant_config,
+            quant_config=vllm_config.quant_config,
             prefix=f"{prefix}.o_proj",
         )
 
         self.rotary_emb = get_rope(
             self.head_dim,
             rotary_dim=self.head_dim,
-            max_position=max_position_embeddings,
-            base=rope_theta,
-            rope_scaling=rope_scaling,
+            max_position=self.max_position_embeddings,
+            base=int(self.rope_theta),
+            rope_scaling=hf_config.rope_scaling,
             is_neox_style=True,
         )
         self.attn = Attention(self.num_heads,
                               self.head_dim,
                               self.scaling,
                               num_kv_heads=self.num_kv_heads,
-                              cache_config=cache_config,
-                              quant_config=quant_config,
+                              cache_config=vllm_config.cache_config,
+                              quant_config=vllm_config.quant_config,
                               prefix=f"{prefix}.attn")
 
     def _apply_qk_norm(self, q: torch.Tensor,
-                       k: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+                       k: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         if self.tp_size > 1:
             q = tensor_model_parallel_all_gather(q.contiguous())
             k = tensor_model_parallel_all_gather(k.contiguous())
@@ -200,45 +268,17 @@ class Olmoe2Attention(nn.Module):
 
 class Olmoe2DecoderLayer(nn.Module):
 
-    def __init__(
-        self,
-        config: Olmoe2Config,
-        cache_config: Optional[CacheConfig] = None,
-        quant_config: Optional[QuantizationConfig] = None,
-        prefix: str = "",
-    ) -> None:
+    def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__()
-        self.hidden_size = config.hidden_size
-        rope_theta = getattr(config, "rope_theta", 10000)
-        rope_scaling = getattr(config, "rope_scaling", None)
-        max_position_embeddings = getattr(config, "max_position_embeddings",
-                                          4096)
+        hf_config = vllm_config.model_config.hf_config
 
-        self.self_attn = Olmoe2Attention(
-            hidden_size=self.hidden_size,
-            num_heads=config.num_attention_heads,
-            num_kv_heads=config.num_key_value_heads,
-            rope_theta=rope_theta,
-            rope_scaling=rope_scaling,
-            max_position_embeddings=max_position_embeddings,
-            rms_norm_eps=config.rms_norm_eps,
-            cache_config=cache_config,
-            quant_config=quant_config,
-            prefix=f"{prefix}.self_attn",
-        )
-
-        self.mlp = Olmoe2MoE(
-            num_experts=config.num_experts,
-            top_k=config.num_experts_per_tok,
-            hidden_size=config.hidden_size,
-            intermediate_size=config.intermediate_size,
-            quant_config=quant_config,
-            prefix=f"{prefix}.mlp",
-        )
-        self.post_attention_layernorm = RMSNorm(config.hidden_size,
-                                                eps=config.rms_norm_eps)
-        self.post_feedforward_layernorm = RMSNorm(config.hidden_size,
-                                                  eps=config.rms_norm_eps)
+        self.self_attn = Olmoe2Attention(vllm_config=vllm_config,
+                                         prefix=f"{prefix}.self_attn")
+        self.mlp = Olmoe2MoE(vllm_config=vllm_config, prefix=f"{prefix}.mlp")
+        self.post_attention_layernorm = RMSNorm(hf_config.hidden_size,
+                                                eps=hf_config.rms_norm_eps)
+        self.post_feedforward_layernorm = RMSNorm(hf_config.hidden_size,
+                                                  eps=hf_config.rms_norm_eps)
 
     def forward(
         self,
@@ -266,8 +306,6 @@ class Olmoe2Model(nn.Module):
 
         config = vllm_config.model_config.hf_config
         assert isinstance(config, Olmoe2Config)
-        cache_config = vllm_config.cache_config
-        quant_config = vllm_config.quant_config
 
         self.vocab_size = config.vocab_size
 
@@ -278,8 +316,8 @@ class Olmoe2Model(nn.Module):
         )
         self.start_layer, self.end_layer, self.layers = make_layers(
             config.num_hidden_layers,
-            lambda prefix: Olmoe2DecoderLayer(
-                config, cache_config, quant_config, prefix=prefix),
+            lambda prefix: Olmoe2DecoderLayer(vllm_config=vllm_config,
+                                              prefix=prefix),
             prefix=f"{prefix}.layers")
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
@@ -372,8 +410,8 @@ class Olmoe2ForCausalLM(nn.Module, SupportsPP):
         next_tokens = self.sampler(logits, sampling_metadata)
         return next_tokens
 
-    def load_weights(self, weights: Iterable[Tuple[str,
-                                                   torch.Tensor]]) -> Set[str]:
+    def load_weights(self, weights: Iterable[tuple[str,
+                                                   torch.Tensor]]) -> set[str]:
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             ("qkv_proj", "q_proj", "q"),
@@ -392,7 +430,7 @@ class Olmoe2ForCausalLM(nn.Module, SupportsPP):
             num_experts=self.config.num_experts)
 
         params_dict = dict(self.named_parameters())
-        loaded_params: Set[str] = set()
+        loaded_params: set[str] = set()
         for name, loaded_weight in weights:
             if "rotary_emb.inv_freq" in name:
                 continue
