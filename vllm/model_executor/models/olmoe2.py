@@ -28,11 +28,9 @@ from vllm.distributed.communication_op import tensor_model_parallel_all_gather
 from vllm.distributed.parallel_state import get_tensor_model_parallel_rank
 from vllm.distributed.utils import split_tensor_along_last_dim
 from vllm.logger import init_logger
-from vllm.model_executor.layers.activation import SiluAndMul
 from vllm.model_executor.layers.fused_moe import FusedMoE
 from vllm.model_executor.layers.layernorm import RMSNorm
-from vllm.model_executor.layers.linear import (MergedColumnParallelLinear,
-                                               QKVParallelLinear,
+from vllm.model_executor.layers.linear import (QKVParallelLinear,
                                                ReplicatedLinear,
                                                RowParallelLinear)
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
@@ -50,52 +48,6 @@ from .utils import (is_pp_missing_parameter,
                     maybe_prefix)
 
 logger = init_logger(__name__)
-
-
-class Olmoe2SharedMLP(nn.Module):
-    """
-    This is the MLP block where the output is computed as
-    ``MLP(x)`` in ``LN(MLP(x + LN(Attention(x))))``
-    (plus another skip connection).
-    """
-
-    def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
-        super().__init__()
-        config = vllm_config.model_config.hf_config
-        assert isinstance(config, Olmoe2Config)
-        hidden_size = config.hidden_size
-        intermediate_size = config.shared_mlp_intermediate_size
-        assert intermediate_size is not None
-
-        # Feed-forward input projection.
-        self.gate_up_proj = MergedColumnParallelLinear(
-            hidden_size,
-            [intermediate_size] * 2,
-            bias=False,
-            quant_config=vllm_config.quant_config,
-            prefix=f"{prefix}.gate_up_proj",
-        )
-
-        # Activation function.
-        self.act_fn = SiluAndMul()
-
-        # Feed-forward output projection.
-        self.down_proj = RowParallelLinear(
-            intermediate_size,
-            hidden_size,
-            bias=False,
-            quant_config=vllm_config.quant_config,
-            prefix=f"{prefix}.down_proj",
-        )
-
-    def forward(
-        self,
-        x: torch.Tensor,
-    ) -> torch.Tensor:
-        gate_up, _ = self.gate_up_proj(x)
-        x = self.act_fn(gate_up)
-        x, _ = self.down_proj(x)
-        return x
 
 
 class Olmoe2MoE(nn.Module):
@@ -129,32 +81,14 @@ class Olmoe2MoE(nn.Module):
                                 intermediate_size=hf_config.intermediate_size,
                                 reduce_results=True,
                                 renormalize=False,
-                                quant_config=None,
                                 tp_size=tp_size,
-                                use_grouped_topk=True,
-                                scoring_func="sigmoid",
-                                num_expert_group=1,
-                                topk_group=1,
                                 prefix=f"{prefix}.experts")
-
-        self.top_k = hf_config.num_experts_per_tok
-
-        self.shared_mlp = None
-        if hf_config.shared_mlp_intermediate_size is not None:
-            self.shared_mlp = Olmoe2SharedMLP(vllm_config=vllm_config,
-                                              prefix=f"{prefix}.shared_mlp")
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         # NOTE: hidden_states can have either 1D or 2D shape.
         orig_shape = hidden_states.shape
         hidden_dim = hidden_states.shape[-1]
         hidden_states = hidden_states.view(-1, hidden_dim)
-
-        shared_hidden_states = None
-        if self.shared_mlp is not None:
-            # The experts mutate the hidden state, so compute this before them
-            # to avoid issues.
-            shared_hidden_states = self.shared_mlp(hidden_states)
 
         # router_logits: (num_tokens, n_experts)
         router_logits, _ = self.gate(hidden_states)
@@ -163,10 +97,6 @@ class Olmoe2MoE(nn.Module):
         final_hidden_states = self.experts(
             hidden_states=hidden_states.detach().clone(),
             router_logits=router_logits)
-
-        if shared_hidden_states is not None:
-            final_hidden_states = (shared_hidden_states + self.top_k *
-                                   final_hidden_states) / (self.top_k + 1)
 
         return final_hidden_states.view(orig_shape)
 
