@@ -103,11 +103,10 @@ class Olmo2Attention(nn.Module):
 
         self.tp_rank = get_tensor_model_parallel_rank()
         self.k_norm = RMSNorm(
-            self.total_num_kv_heads * self.head_dim,
+            self.head_dim,
             eps=self.config.rms_norm_eps,
         )
-        self.q_norm = RMSNorm(self.config.hidden_size,
-                              eps=self.config.rms_norm_eps)
+        self.q_norm = RMSNorm(self.head_dim, eps=self.config.rms_norm_eps)
 
         # Rotary embeddings.
         self.rotary_emb = get_rope(
@@ -141,8 +140,9 @@ class Olmo2Attention(nn.Module):
         if self.tp_size > 1:
             q = tensor_model_parallel_all_gather(q.contiguous())
             k = tensor_model_parallel_all_gather(k.contiguous())
-        q = self.q_norm(q)
-        k = self.k_norm(k)
+
+        q = self.q_norm(q.unflatten(-1, (-1, self.head_dim))).reshape(q.shape)
+        k = self.k_norm(k.unflatten(-1, (-1, self.head_dim))).reshape(k.shape)
         if self.tp_size > 1:
             splitter = partial(split_tensor_along_last_dim,
                                num_partitions=self.tp_size)
