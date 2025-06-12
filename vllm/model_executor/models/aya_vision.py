@@ -1,8 +1,8 @@
-# SPDX-License-Identifier: Apache-2.0 Adapted from
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project Adapted from
 # https://github.com/huggingface/transformers/tree/main/src/transformers/models/aya_vision
-from functools import cached_property
-from typing import (Iterable, Literal, Mapping, Optional, Sequence, Set, Tuple,
-                    TypedDict, Union, cast)
+from collections.abc import Iterable, Mapping, Sequence
+from typing import Literal, Optional, TypedDict, Union, cast
 
 import torch
 from torch import nn
@@ -17,7 +17,6 @@ from transformers.models.got_ocr2.image_processing_got_ocr2 import (
 
 from vllm.config import VllmConfig
 from vllm.jsontree import json_map_leaves
-from vllm.model_executor.layers.sampler import SamplerOutput, get_sampler
 from vllm.model_executor.sampling_metadata import SamplingMetadata
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.inputs import MultiModalDataDict, MultiModalKwargs
@@ -112,7 +111,13 @@ class AyaVisionProcessingInfo(BaseProcessingInfo):
         return self.ctx.get_hf_config(AyaVisionConfig)
 
     def get_hf_processor(self, **kwargs: object) -> AyaVisionProcessor:
-        return self.ctx.get_hf_processor(AyaVisionProcessor, **kwargs)
+        processor = self.ctx.get_hf_processor(AyaVisionProcessor, **kwargs)
+
+        # Temporary workaround since this processor has multiple image tokens
+        # See https://github.com/huggingface/transformers/issues/38350
+        processor._check_special_mm_tokens = lambda *args, **kwargs: None
+
+        return processor
 
     def get_image_processor(self) -> GotOcr2ImageProcessor:
         return self.get_hf_processor().image_processor
@@ -189,9 +194,7 @@ class AyaVisionMultiModalProcessor(
         image_processor = hf_processor.image_processor
 
         # HF processor pops the `num_patches` kwarg, which is needed by vLLM
-        if (images :=
-                mm_data.get("images")) is not None and '<image>' in prompt:
-            assert isinstance(images, list)
+        if (images := mm_data.get("images")) is not None:
             parsed_images = (self._get_data_parser().parse_mm_data({
                 "image":
                 images
@@ -317,8 +320,8 @@ class AyaVisionForConditionalGeneration(nn.Module, SupportsMultiModal,
     def dtype(self):
         return next(self.parameters()).dtype
 
-    def load_weights(self, weights: Iterable[Tuple[str,
-                                                   torch.Tensor]]) -> Set[str]:
+    def load_weights(self, weights: Iterable[tuple[str,
+                                                   torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(self)
         return loader.load_weights(weights)
 
@@ -461,17 +464,3 @@ class AyaVisionForConditionalGeneration(nn.Module, SupportsMultiModal,
     ) -> Optional[torch.Tensor]:
         return self.language_model.compute_logits(hidden_states,
                                                   sampling_metadata)
-
-    @cached_property
-    def sampler(self):
-        if hasattr(self.language_model, "sampler"):
-            return self.language_model.sampler
-
-        return get_sampler()
-
-    def sample(
-        self,
-        logits: torch.Tensor,
-        sampling_metadata: SamplingMetadata,
-    ) -> Optional[SamplerOutput]:
-        return self.language_model.sample(logits, sampling_metadata)

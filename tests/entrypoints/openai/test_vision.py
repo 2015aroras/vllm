@@ -1,4 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
+import json
 
 import openai
 import pytest
@@ -35,7 +38,7 @@ def server():
         "--enforce-eager",
         "--trust-remote-code",
         "--limit-mm-per-prompt",
-        f"image={MAXIMUM_IMAGES}",
+        json.dumps({"image": MAXIMUM_IMAGES}),
     ]
 
     with RemoteOpenAIServer(MODEL_NAME, args) as remote_server:
@@ -133,6 +136,36 @@ async def test_single_chat_session_image(client: openai.AsyncOpenAI,
     )
     message = chat_completion.choices[0].message
     assert message.content is not None and len(message.content) >= 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("model_name", [MODEL_NAME])
+@pytest.mark.parametrize("image_url", TEST_IMAGE_URLS)
+async def test_error_on_invalid_image_url_type(client: openai.AsyncOpenAI,
+                                               model_name: str,
+                                               image_url: str):
+    content_text = "What's in this image?"
+    messages = [{
+        "role":
+        "user",
+        "content": [
+            {
+                "type": "image_url",
+                "image_url": image_url
+            },
+            {
+                "type": "text",
+                "text": content_text
+            },
+        ],
+    }]
+
+    # image_url should be a dict {"url": "some url"}, not directly a string
+    with pytest.raises(openai.BadRequestError):
+        _ = await client.chat.completions.create(model=model_name,
+                                                 messages=messages,
+                                                 max_completion_tokens=10,
+                                                 temperature=0.0)
 
 
 @pytest.mark.asyncio
