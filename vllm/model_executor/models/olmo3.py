@@ -50,7 +50,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.models.interfaces import SupportsPP
 from vllm.model_executor.models.utils import (
-    AutoWeightsLoader, is_pp_missing_parameter,
+    AutoWeightsLoader, extract_layer_index, is_pp_missing_parameter,
     make_empty_intermediate_tensors_factory, make_layers, maybe_prefix)
 from vllm.model_executor.sampling_metadata import SamplingMetadata
 from vllm.sequence import IntermediateTensors
@@ -116,6 +116,11 @@ class Olmo3Attention(nn.Module):
             base=self.rope_theta,  # type: ignore
         )
         self.scaling = self.head_dim**-0.5
+
+        layer_idx = extract_layer_index(prefix)
+        sliding_window = (self.config.sliding_window
+                          if self.config.layer_types[layer_idx]
+                          == "sliding_attention" else None)
         self.attn = Attention(
             self.num_heads,
             self.head_dim,
@@ -123,7 +128,8 @@ class Olmo3Attention(nn.Module):
             num_kv_heads=self.num_kv_heads,
             cache_config=vllm_config.cache_config,
             quant_config=vllm_config.quant_config,
-            prefix=prefix,
+            per_layer_sliding_window=sliding_window,
+            prefix=f"{prefix}.attn",
         )
 
         # Attention output projection.
@@ -360,6 +366,11 @@ class Olmo3ForCausalLM(nn.Module, SupportsPP):
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
+
+        # Disable this caching because it makes all the attention layers use
+        # sliding window, even though some layers should be full attention.
+        vllm_config.cache_config.sliding_window = None
+
         config = vllm_config.model_config.hf_config
         assert isinstance(config, Olmo3Config)
         self.config = config
