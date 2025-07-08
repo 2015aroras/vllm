@@ -33,6 +33,7 @@ from torch import nn
 from transformers import Olmo3Config
 
 from vllm.attention import Attention
+from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig
 from vllm.distributed import get_pp_group, get_tensor_model_parallel_world_size
 from vllm.distributed.communication_op import tensor_model_parallel_all_gather
@@ -258,6 +259,7 @@ class Olmo3DecoderLayer(nn.Module):
         return hidden_states
 
 
+@support_torch_compile
 class Olmo3Model(nn.Module):
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
