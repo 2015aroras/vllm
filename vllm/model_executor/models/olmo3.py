@@ -109,13 +109,6 @@ class Olmo3Attention(nn.Module):
         )
         self.q_norm = RMSNorm(self.head_dim, eps=self.config.rms_norm_eps)
 
-        # Rotary embeddings.
-        self.rotary_emb = get_rope(
-            self.head_dim,
-            rotary_dim=self.head_dim,
-            max_position=self.max_position_embeddings,
-            base=self.rope_theta,  # type: ignore
-        )
         self.scaling = self.head_dim**-0.5
 
         layer_idx = extract_layer_index(prefix)
@@ -131,6 +124,17 @@ class Olmo3Attention(nn.Module):
             quant_config=vllm_config.quant_config,
             per_layer_sliding_window=sliding_window,
             prefix=f"{prefix}.attn",
+        )
+
+        # Rotary embeddings.
+        self.rope_scaling = getattr(self.config, "rope_scaling",
+                                    None) if sliding_window is None else None
+        self.rotary_emb = get_rope(
+            self.head_dim,
+            rotary_dim=self.head_dim,
+            max_position=self.max_position_embeddings,
+            base=self.rope_theta,  # type: ignore
+            rope_scaling=self.rope_scaling,
         )
 
         # Attention output projection.
